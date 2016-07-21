@@ -139,6 +139,8 @@
     <Compile Include="IDs\UniqueKey.cs" />
     <Compile Include="Core\IGrainFactory.cs" />
     <Compile Include="Runtime\IGrainRuntime.cs" />
+    <Compile Include="Serialization\Wire\ByteArraySegmentSerializerFactory.cs" />
+    <Compile Include="Serialization\Wire\OrleansExternalSerializerFacory.cs" />
     <Compile Include="Serialization\OrleansJsonSerializer.cs" />
     <Compile Include="Serialization\BinaryFormatterSerializer.cs" />
     <Compile Include="Streams\Core\StreamIdentity.cs" />

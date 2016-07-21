@@ -19,54 +19,13 @@ using Orleans.Runtime.Configuration;
 using Newtonsoft.Json;
 using Orleans.Providers;
 using System.Runtime.Serialization.Formatters;
+using Orleans.Serialization.Wire;
 using Wire;
 using Wire.SerializerFactories;
-using Wire.ValueSerializers;
 using Utils = Orleans.Runtime.Utils;
 
 namespace Orleans.Serialization
 {
-    public class OrleansExternalSerializerFacory : ValueSerializerFactory
-    {
-        private readonly IReadOnlyList<IExternalSerializer> _serializers;
-
-        public OrleansExternalSerializerFacory(IReadOnlyList<IExternalSerializer> serializers)
-        {
-            _serializers = serializers;
-        }
-        public override bool CanSerialize(Serializer serializer, Type type)
-        {
-            return _serializers.Any(es => es.IsSupportedType(type));
-        }
-
-        public override bool CanDeserialize(Serializer serializer, Type type)
-        {
-            return CanSerialize(serializer,type);
-        }
-
-        public override ValueSerializer BuildSerializer(Serializer serializer, Type type, ConcurrentDictionary<Type, ValueSerializer> typeMapping)
-        {
-            var ex = _serializers.First(es => es.IsSupportedType(type));
-            var s = new ObjectSerializer(type);
-            ObjectReader reader = (stream, session) =>
-            {
-                var bytes = stream.ReadLengthEncodedByteArray(session);
-                var btr = new BinaryTokenStreamReader(bytes);
-                var obj = ex.Deserialize(type, btr);
-                return obj;
-            };
-            ObjectWriter writer = (stream, value, session) =>
-            {
-                var btw = new BinaryTokenStreamWriter();
-                ex.Serialize(value,btw,type);
-                var bytes = btw.ToByteArray();
-                stream.WriteLengthEncodedByteArray(bytes);
-            };
-            typeMapping.TryAdd(type, s);
-            s.Initialize(reader,writer);
-            return s;
-        }
-    }
     /// <summary>
     /// SerializationManager to oversee the Orleans serializer system.
     /// </summary>
@@ -74,7 +33,7 @@ namespace Orleans.Serialization
     {
         internal const string UseFullAssemblyNamesProperty = "UseFullAssemblyNames";
         internal const string IndentJsonProperty = "IndentJSON";
-        private static Wire.Serializer wire = null;
+        private static global::Wire.Serializer wire = null;
 
 
         /// <summary>
@@ -219,10 +178,16 @@ namespace Orleans.Serialization
 
         private static void InitWire()
         {
-            var orleansExternalSerializerFacory = new OrleansExternalSerializerFacory(externalSerializers);
-            var wireOptions = new SerializerOptions(preserveObjectReferences: true,
-                serializerFactories: new[] {orleansExternalSerializerFacory});
-            wire = new Wire.Serializer(wireOptions);
+            var orleansExternalSerializer = new OrleansExternalSerializerFacory(externalSerializers);
+            var byteArraySegmentSerializer = new ByteArraySegmentSerializerFactory();
+            var wireOptions = new SerializerOptions(
+                preserveObjectReferences: true,
+                serializerFactories: new ValueSerializerFactory[]
+                {
+                    orleansExternalSerializer,
+                    byteArraySegmentSerializer
+                });
+            wire = new global::Wire.Serializer(wireOptions);
         }
 
         internal static void Initialize(bool useStandardSerializer, List<TypeInfo> serializationProviders, bool useJsonFallbackSerializer)
@@ -625,7 +590,6 @@ namespace Orleans.Serialization
             bool systemAssembly = !assembly.IsDynamic
                                   && (assembly.FullName.StartsWith("mscorlib", StringComparison.OrdinalIgnoreCase)
                                       || assembly.FullName.StartsWith("System.", StringComparison.Ordinal));
-            IExternalSerializer externalSerializer;
 
             if (logger.IsVerbose2) logger.Verbose2("Scanning assembly {0} for serialization info", assembly.GetLocationSafe());
 
@@ -759,29 +723,33 @@ namespace Orleans.Serialization
                                         type.Name,
                                         assembly.GetName().Name);
                             }
-                            else if (TryLookupExternalSerializer(type, out externalSerializer))
-                            {
-                                // the lookup registers the serializer.
-                            }
-                            else if (!type.GetTypeInfo().IsSerializable)
-                            {
-                                // Comparers with no fields can be safely dealt with as just a type name
-                                var comparer = false;
-                                foreach (var iface in type.GetInterfaces()) {
-                                    var ifaceTypeInfo = iface.GetTypeInfo();
-                                    if (ifaceTypeInfo.IsGenericType
-                                        && (ifaceTypeInfo.GetGenericTypeDefinition() == typeof(IComparer<>)
-                                            || ifaceTypeInfo.GetGenericTypeDefinition() == typeof(IEqualityComparer<>)))
-                                    {
-                                        comparer = true;
-                                        break;
-                                    }
-                                }
-                                if (comparer && (type.GetFields().Length == 0)) Register(type);
-                            }
                             else
                             {
-                                Register(type);
+                                IExternalSerializer externalSerializer;
+                                if (TryLookupExternalSerializer(type, out externalSerializer))
+                                {
+                                    // the lookup registers the serializer.
+                                }
+                                else if (!type.GetTypeInfo().IsSerializable)
+                                {
+                                    // Comparers with no fields can be safely dealt with as just a type name
+                                    var comparer = false;
+                                    foreach (var iface in type.GetInterfaces()) {
+                                        var ifaceTypeInfo = iface.GetTypeInfo();
+                                        if (ifaceTypeInfo.IsGenericType
+                                            && (ifaceTypeInfo.GetGenericTypeDefinition() == typeof(IComparer<>)
+                                                || ifaceTypeInfo.GetGenericTypeDefinition() == typeof(IEqualityComparer<>)))
+                                        {
+                                            comparer = true;
+                                            break;
+                                        }
+                                    }
+                                    if (comparer && (type.GetFields().Length == 0)) Register(type);
+                                }
+                                else
+                                {
+                                    Register(type);
+                                }
                             }
                         }
                     }
@@ -981,9 +949,9 @@ namespace Orleans.Serialization
                 Copies.Increment();
             }
 
-            SerializationContext.Current.Reset();
+          //  SerializationContext.Current.Reset();
             object copy = DeepCopyInner(original);
-            SerializationContext.Current.Reset();
+          //  SerializationContext.Current.Reset();
             
 
             if (timer!=null)
@@ -1006,129 +974,13 @@ namespace Orleans.Serialization
         {
             if (original == null) return null;
 
-            var t = original.GetType();
-            var shallow = t.IsOrleansShallowCopyable();
-
-            if (shallow)
-                return original;
-
-            var reference = SerializationContext.Current.CheckObjectWhileCopying(original);
-            if (reference != null)
-                return reference;
-
-            object copy;
-
-            IExternalSerializer serializer;
-            if (TryLookupExternalSerializer(t, out serializer))
+            using (var ms = new MemoryStream())
             {
-                copy = serializer.DeepCopy(original);
-                SerializationContext.Current.RecordObject(original, copy);
-                return copy;
+                wire.Serialize(original,ms);
+                ms.Position = 0;
+                var clone = wire.Deserialize(ms);
+                return clone;
             }
-
-            var copier = GetCopier(t);
-            if (copier != null)
-            {
-                copy = copier(original);
-                SerializationContext.Current.RecordObject(original, copy);
-                return copy;
-            }
-
-            return DeepCopierHelper(t, original);
-        }
-
-        private static object DeepCopierHelper(Type t, object original)
-        {
-            // Arrays are all that's left. 
-            // Handling arbitrary-rank arrays is a bit complex, but why not?
-            var originalArray = original as Array;
-            if (originalArray != null)
-            {
-                if (originalArray.Rank == 1 && originalArray.GetLength(0) == 0)
-                {
-                    // A common special case - empty one dimentional array
-                    return originalArray;
-                }
-                // A common special case
-                if ((original is byte[]) && (originalArray.Rank == 1))
-                {
-                    var source = (byte[])original;
-                    if (source.Length > LARGE_OBJECT_LIMIT)
-                    {
-                        logger.Info(ErrorCode.Ser_LargeObjectAllocated,
-                            "Large byte array of size {0} is being copied. This will result in an allocation on the large object heap. " +
-                            "Frequent allocations to the large object heap can result in frequent gen2 garbage collections and poor system performance. " +
-                            "Please consider using Immutable<byte[]> instead.", source.Length);
-                    }
-                    var dest = new byte[source.Length];
-                    Array.Copy(source, dest, source.Length);
-                    return dest;
-                }
-
-                var et = t.GetElementType();
-                var etInfo = et.GetTypeInfo();
-                if (et.IsOrleansShallowCopyable())
-                {
-                    // Only check the size for primitive types because otherwise Buffer.ByteLength throws
-                    if (etInfo.IsPrimitive && Buffer.ByteLength(originalArray) > LARGE_OBJECT_LIMIT)
-                    {
-                        logger.Info(ErrorCode.Ser_LargeObjectAllocated,
-                            "Large {0} array of total byte size {1} is being copied. This will result in an allocation on the large object heap. " +
-                            "Frequent allocations to the large object heap can result in frequent gen2 garbage collections and poor system performance. " +
-                            "Please consider using Immutable<{0}> instead.", t.OrleansTypeName(), Buffer.ByteLength(originalArray));
-                    }
-                    return originalArray.Clone();
-                }
-
-                // We assume that all arrays have lower bound 0. In .NET 4.0, it's hard to create an array with a non-zero lower bound.
-                var rank = originalArray.Rank;
-                var lengths = new int[rank];
-                for (var i = 0; i < rank; i++)
-                    lengths[i] = originalArray.GetLength(i);
-
-                var copyArray = Array.CreateInstance(et, lengths);
-                SerializationContext.Current.RecordObject(original, copyArray);
-
-                if (rank == 1)
-                {
-                    for (var i = 0; i < lengths[0]; i++)
-                        copyArray.SetValue(DeepCopyInner(originalArray.GetValue(i)), i);
-                }
-                else if (rank == 2)
-                {
-                    for (var i = 0; i < lengths[0]; i++)
-                        for (var j = 0; j < lengths[1]; j++)
-                            copyArray.SetValue(DeepCopyInner(originalArray.GetValue(i, j)), i, j);
-                }
-                else
-                {
-                    var index = new int[rank];
-                    var sizes = new int[rank];
-                    sizes[rank - 1] = 1;
-                    for (var k = rank - 2; k >= 0; k--)
-                        sizes[k] = sizes[k + 1]*lengths[k + 1];
-
-                    for (var i = 0; i < originalArray.Length; i++)
-                    {
-                        int k = i;
-                        for (int n = 0; n < rank; n++)
-                        {
-                            int offset = k / sizes[n];
-                            k = k - offset * sizes[n];
-                            index[n] = offset;
-                        }
-                        copyArray.SetValue(DeepCopyInner(originalArray.GetValue(index)), index);
-                    }
-                }
-                return copyArray;
-
-            }
-
-            if (t.GetTypeInfo().IsSerializable)
-                return FallbackSerializationDeepCopy(original);
-
-            throw new OrleansException("No copier found for object of type " + t.OrleansTypeName() + 
-                ". Perhaps you need to mark it [Serializable] or define a custom serializer for it?");
         }
 
         #endregion
