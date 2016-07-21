@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Net;
@@ -18,9 +19,54 @@ using Orleans.Runtime.Configuration;
 using Newtonsoft.Json;
 using Orleans.Providers;
 using System.Runtime.Serialization.Formatters;
+using Wire;
+using Wire.SerializerFactories;
+using Wire.ValueSerializers;
+using Utils = Orleans.Runtime.Utils;
 
 namespace Orleans.Serialization
 {
+    public class OrleansExternalSerializerFacory : ValueSerializerFactory
+    {
+        private readonly IReadOnlyList<IExternalSerializer> _serializers;
+
+        public OrleansExternalSerializerFacory(IReadOnlyList<IExternalSerializer> serializers)
+        {
+            _serializers = serializers;
+        }
+        public override bool CanSerialize(Serializer serializer, Type type)
+        {
+            return _serializers.Any(es => es.IsSupportedType(type));
+        }
+
+        public override bool CanDeserialize(Serializer serializer, Type type)
+        {
+            return CanSerialize(serializer,type);
+        }
+
+        public override ValueSerializer BuildSerializer(Serializer serializer, Type type, ConcurrentDictionary<Type, ValueSerializer> typeMapping)
+        {
+            var ex = _serializers.First(es => es.IsSupportedType(type));
+            var s = new ObjectSerializer(type);
+            ObjectReader reader = (stream, session) =>
+            {
+                var bytes = stream.ReadLengthEncodedByteArray(session);
+                var btr = new BinaryTokenStreamReader(bytes);
+                var obj = ex.Deserialize(type, btr);
+                return obj;
+            };
+            ObjectWriter writer = (stream, value, session) =>
+            {
+                var btw = new BinaryTokenStreamWriter();
+                ex.Serialize(value,btw,type);
+                var bytes = btw.ToByteArray();
+                stream.WriteLengthEncodedByteArray(bytes);
+            };
+            typeMapping.TryAdd(type, s);
+            s.Initialize(reader,writer);
+            return s;
+        }
+    }
     /// <summary>
     /// SerializationManager to oversee the Orleans serializer system.
     /// </summary>
@@ -28,6 +74,8 @@ namespace Orleans.Serialization
     {
         internal const string UseFullAssemblyNamesProperty = "UseFullAssemblyNames";
         internal const string IndentJsonProperty = "IndentJSON";
+        private static Wire.Serializer wire = null;
+
 
         /// <summary>
         /// Deep copier function.
@@ -156,8 +204,10 @@ namespace Orleans.Serialization
             try
             {
                 RegisterBuiltInSerializers();
+                
                 BufferPool.InitGlobalBufferPool(new MessagingConfiguration(false));
                 RegisterSerializationProviders(serializationProviders);
+                InitWire();
                 AssemblyProcessor.Initialize();
                 fallbackSerializer = GetFallbackSerializer(useJsonFallbackSerializer);
             }
@@ -165,6 +215,14 @@ namespace Orleans.Serialization
             {
                 throw ex.Flatten();
             }
+        }
+
+        private static void InitWire()
+        {
+            var orleansExternalSerializerFacory = new OrleansExternalSerializerFacory(externalSerializers);
+            var wireOptions = new SerializerOptions(preserveObjectReferences: true,
+                serializerFactories: new[] {orleansExternalSerializerFacory});
+            wire = new Wire.Serializer(wireOptions);
         }
 
         internal static void Initialize(bool useStandardSerializer, List<TypeInfo> serializationProviders, bool useJsonFallbackSerializer)
@@ -216,6 +274,7 @@ namespace Orleans.Serialization
             }
 
             RegisterSerializationProviders(serializationProviders);
+            InitWire();
             AssemblyProcessor.Initialize();
         }
 
@@ -1123,12 +1182,12 @@ namespace Orleans.Serialization
                 timer.Start();
                 Serializations.Increment();
             }
-            
-            SerializationContext.Current.Reset();
+
+            //    SerializationContext.Current.Reset();
             SerializeInner(raw, stream, null);
-            SerializationContext.Current.Reset();
-            
-            if (timer!=null)
+            //    SerializationContext.Current.Reset();
+
+            if (timer != null)
             {
                 timer.Stop();
                 SerTimeStatistic.IncrementBy(timer.ElapsedTicks);
@@ -1144,249 +1203,17 @@ namespace Orleans.Serialization
         [SuppressMessage("Microsoft.Usage", "CA2201:DoNotRaiseReservedExceptionTypes")]
         public static void SerializeInner(object obj, BinaryTokenStreamWriter stream, Type expected)
         {
-            // Nulls get special handling
-            if (obj == null)
+            using (var ms = new MemoryStream())
             {
-                stream.WriteNull();
-                return;
-            }
+                wire.Serialize(obj,ms);
+                var bytes = ms.ToArray();
+                stream.Write(bytes.Length);
+                stream.Write(ms.ToArray());
 
-            var t = obj.GetType();
-            var typeInfo = t.GetTypeInfo();
-
-            // Enums are extra-special
-            if (typeInfo.IsEnum)
-            {
-                stream.WriteTypeHeader(t, expected);
-                stream.Write(Convert.ToInt32(obj));
-                return;
-            }
-
-            // Check for simple types
-            if (stream.TryWriteSimpleObject(obj)) return;
-
-            // Check for primitives
-            // At this point, we're either an object or a non-trivial value type
-
-            // Start by checking to see if we're a back-reference, and recording us for possible future back-references if not
-            if (!typeInfo.IsValueType)
-            {
-                int reference = SerializationContext.Current.CheckObjectWhileSerializing(obj);
-                if (reference >= 0)
-                {
-                    stream.WriteReference(reference);
-                    return;
-                }
-                SerializationContext.Current.RecordObject(obj, stream.CurrentOffset);
-            }
-
-            // If we're simply a plain old unadorned, undifferentiated object, life is easy
-            if (typeInfo.TypeHandle.Equals(objectTypeHandle))
-            {
-                stream.Write(SerializationTokenType.SpecifiedType);
-                stream.Write(SerializationTokenType.Object);
-                return;
-            }
-
-            // Arrays get handled specially
-            if (typeInfo.IsArray)
-            {
-                var et = t.GetElementType();
-                if (HasOrleansSerialization(et))
-                {
-                    SerializeArray((Array)obj, stream, expected, et);
-                }
-                else
-                {
-                    FallbackSerializer(obj, stream, et);
-                }
-                return;
-            }
-
-            IExternalSerializer serializer;
-            if (TryLookupExternalSerializer(t, out serializer))
-            {
-                stream.WriteTypeHeader(t, expected);
-                serializer.Serialize(obj, stream, expected);
-                return;
-            }
-
-            Serializer ser = GetSerializer(t);
-            if (ser != null)
-            {
-                stream.WriteTypeHeader(t, expected);
-                ser(obj, stream, expected);
-                return;
-            }
-
-            if (typeInfo.IsSerializable)
-            {
-                FallbackSerializer(obj, stream, t);
-                return;
-            }
-
-            if ((obj is Exception) && !typeInfo.IsSerializable)
-            {
-                // Exceptions should always be serializable, and thus handled by the prior if.
-                // In case someone creates a non-serializable exception, though, we don't want to 
-                // throw and return a serialization exception...
-                // Note that the "!t.IsSerializable" is redundant in this if, but it's there in case
-                // this code block moves.
-                var rawException = obj as Exception;
-                var foo = new Exception(String.Format("Non-serializable exception of type {0}: {1}" + Environment.NewLine + "at {2}",
-                                                      t.OrleansTypeName(), rawException.Message,
-                                                      rawException.StackTrace));
-                FallbackSerializer(foo, stream, t);
-                return;
-            }
-
-            throw new ArgumentException("No serializer found for object of type " + t.OrleansTypeName()
-                 + ". Perhaps you need to mark it [Serializable] or define a custom serializer for it?");
-        }
-
-        // We assume that all lower bounds are 0, since creating an array with lower bound !=0 is hard in .NET 4.0+
-        private static void SerializeArray(Array array, BinaryTokenStreamWriter stream, Type expected, Type et)
-        {
-            var etTypeInfo = et.GetTypeInfo();
-
-            // First check for one of the optimized cases
-            if (array.Rank == 1)
-            {
-                if (etTypeInfo.TypeHandle.Equals(byteTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.ByteArray);
-                    stream.Write(array.Length);
-                    stream.Write((byte[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(boolTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.BoolArray);
-                    stream.Write(array.Length);
-                    stream.Write((bool[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(charTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.CharArray);
-                    stream.Write(array.Length);
-                    stream.Write((char[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(shortTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.ShortArray);
-                    stream.Write(array.Length);
-                    stream.Write((short[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(intTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.IntArray);
-                    stream.Write(array.Length);
-                    stream.Write((int[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(longTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.LongArray);
-                    stream.Write(array.Length);
-                    stream.Write((long[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(ushortTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.UShortArray);
-                    stream.Write(array.Length);
-                    stream.Write((ushort[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(uintTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.UIntArray);
-                    stream.Write(array.Length);
-                    stream.Write((uint[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(ulongTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.ULongArray);
-                    stream.Write(array.Length);
-                    stream.Write((ulong[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(floatTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.FloatArray);
-                    stream.Write(array.Length);
-                    stream.Write((float[])array);
-                    return;
-                }
-                if (etTypeInfo.TypeHandle.Equals(doubleTypeHandle))
-                {
-                    stream.Write(SerializationTokenType.SpecifiedType);
-                    stream.Write(SerializationTokenType.DoubleArray);
-                    stream.Write(array.Length);
-                    stream.Write((double[])array);
-                    return;
-                }
-            }
-
-            // Write the array header
-            stream.WriteArrayHeader(array, expected);
-
-            // Figure out the array size
-            var rank = array.Rank;
-            var lengths = new int[rank];
-            for (var i = 0; i < rank; i++)
-            {
-                lengths[i] = array.GetLength(i);
-            }
-
-            if (rank == 1)
-            {
-                for (int i = 0; i < lengths[0]; i++)
-                    SerializeInner(array.GetValue(i), stream, et);
-            }
-            else if (rank == 2)
-            {
-                for (int i = 0; i < lengths[0]; i++)
-                    for (int j = 0; j < lengths[1]; j++)
-                        SerializeInner(array.GetValue(i, j), stream, et);
-            }
-            else
-            {
-                var index = new int[rank];
-                var sizes = new int[rank];
-                sizes[rank - 1] = 1;
-                for (var k = rank - 2; k >= 0; k--)
-                    sizes[k] = sizes[k + 1]*lengths[k + 1];
-
-                for (var i = 0; i < array.Length; i++)
-                {
-                    int k = i;
-                    for (int n = 0; n < rank; n++)
-                    {
-                        int offset = k / sizes[n];
-                        k = k - offset * sizes[n];
-                        index[n] = offset;
-                    }
-                    SerializeInner(array.GetValue(index), stream, et);
-                }
             }
         }
 
-        /// <summary>
+       /// <summary>
         /// Serialize data into byte[].
         /// </summary>
         /// <param name="raw">Input data.</param>
@@ -1442,24 +1269,22 @@ namespace Orleans.Serialization
         /// <returns>Object of the required Type, rehydrated from the input stream.</returns>
         public static object Deserialize(Type t, BinaryTokenStreamReader stream)
         {
-            Stopwatch timer = null;
-            if (StatisticsCollector.CollectSerializationStats)
-            {
-                timer = new Stopwatch();
-                timer.Start();
-                Deserializations.Increment();
-            }
+            //Stopwatch timer = null;
+            //if (StatisticsCollector.CollectSerializationStats)
+            //{
+            //    timer = new Stopwatch();
+            //    timer.Start();
+            //    Deserializations.Increment();
+            //}
             object result = null;
             
-            DeserializationContext.Current.Reset();
             result = DeserializeInner(t, stream);
-            DeserializationContext.Current.Reset();
             
-            if (timer!=null)
-            {
-                timer.Stop();
-                DeserTimeStatistic.IncrementBy(timer.ElapsedTicks);
-            }
+            //if (timer!=null)
+            //{
+            //    timer.Stop();
+            //    DeserTimeStatistic.IncrementBy(timer.ElapsedTicks);
+            //}
             return result;
         }
 
@@ -1487,232 +1312,21 @@ namespace Orleans.Serialization
 
             try
             {
-                // NOTE: we don't check that the actual dynamic result implements the expected type.
-                // We'll allow a cast exception higher up to catch this.
-                SerializationTokenType token;
-                object result;
-                if (stream.TryReadSimpleType(out result, out token))
+                var length = stream.ReadInt();
+                var bytes = stream.ReadBytes(length);
+                using (var ms = new MemoryStream(bytes))
                 {
-                    return result;
+                    var obj = wire.Deserialize(ms);
+                    return obj;
                 }
 
-                // Special serializations (reference, fallback)
-                if (token == SerializationTokenType.Reference)
-                {
-                    var offset = stream.ReadInt();
-                    result = DeserializationContext.Current.FetchReferencedObject(offset);
-                    return result;
-                }
-                if (token == SerializationTokenType.Fallback)
-                {
-                    var fallbackResult = FallbackDeserializer(stream);
-                    DeserializationContext.Current.RecordObject(fallbackResult);
-                    return fallbackResult;
-                }
-
-                Type resultType;
-                if (token == SerializationTokenType.ExpectedType)
-                {
-                    if (expected == null)
-                    {
-                        throw new SerializationException("ExpectedType token encountered but no expected type provided");
-                    }
-
-                    resultType = expected;
-                }
-                else if (token == SerializationTokenType.SpecifiedType)
-                {
-                    resultType = stream.ReadSpecifiedTypeHeader();
-                }
-                else
-                {
-                    throw new SerializationException("Unexpected token '" + token + "' introducing type specifier");
-                }
-
-                // Handle object, which is easy
-                if (resultType.TypeHandle.Equals(objectTypeHandle))
-                {
-                    return new object();
-                }
-
-                var resultTypeInfo = resultType.GetTypeInfo();
-                // Handle enums
-                if (resultTypeInfo.IsEnum)
-                {
-                    result = Enum.ToObject(resultType, stream.ReadInt());
-                    return result;
-                }
-
-                if (resultTypeInfo.IsArray)
-                {
-                    result = DeserializeArray(resultType, stream);
-                    DeserializationContext.Current.RecordObject(result);
-                    return result;
-                }
-
-                IExternalSerializer serializer;
-                if (TryLookupExternalSerializer(resultType, out serializer))
-                {
-                    result = serializer.Deserialize(resultType, stream);
-                    DeserializationContext.Current.RecordObject(result);
-                    return result;
-                }
-
-                var deser = GetDeserializer(resultType);
-                if (deser != null)
-                {
-                    result = deser(resultType, stream);
-                    DeserializationContext.Current.RecordObject(result);
-                    return result;
-                }
-
-                throw new SerializationException(
-                    "Unsupported type '" + resultType.OrleansTypeName()
-                    + "' encountered. Perhaps you need to mark it [Serializable] or define a custom serializer for it?");
             }
             finally
             {
                 DeserializationContext.Current.CurrentObjectOffset = previousOffset;
             }
         }
-
-        private static object DeserializeArray(Type resultType, BinaryTokenStreamReader stream)
-        {
-            var lengths = ReadArrayLengths(resultType.GetArrayRank(), stream);
-            var rank = lengths.Length;
-            var et = resultType.GetElementType();
-
-            // Optimized special cases
-            if (rank == 1)
-            {
-                if (et.TypeHandle.Equals(byteTypeHandle))
-                    return stream.ReadBytes(lengths[0]);
-
-                if (et.TypeHandle.Equals(sbyteTypeHandle))
-                {
-                    var result = new sbyte[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(shortTypeHandle))
-                {
-                    var result = new short[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(intTypeHandle))
-                {
-                    var result = new int[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(longTypeHandle))
-                {
-                    var result = new long[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(ushortTypeHandle))
-                {
-                    var result = new ushort[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(uintTypeHandle))
-                {
-                    var result = new uint[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(ulongTypeHandle))
-                {
-                    var result = new ulong[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(doubleTypeHandle))
-                {
-                    var result = new double[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(floatTypeHandle))
-                {
-                    var result = new float[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(charTypeHandle))
-                {
-                    var result = new char[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-                if (et.TypeHandle.Equals(boolTypeHandle))
-                {
-                    var result = new bool[lengths[0]];
-                    var n = Buffer.ByteLength(result);
-                    stream.ReadBlockInto(result, n);
-                    return result;
-                }
-            }
-
-            var array = Array.CreateInstance(et, lengths);
-
-            if (rank == 1)
-            {
-                for (int i = 0; i < lengths[0]; i++)
-                    array.SetValue(DeserializeInner(et, stream), i);
-            }
-            else if (rank == 2)
-            {
-                for (int i = 0; i < lengths[0]; i++)
-                    for (int j = 0; j < lengths[1]; j++)
-                        array.SetValue(DeserializeInner(et, stream), i, j);
-            }
-            else
-            {
-                var index = new int[rank];
-                var sizes = new int[rank];
-                sizes[rank - 1] = 1;
-                for (var k = rank - 2; k >= 0; k--)
-                    sizes[k] = sizes[k + 1]*lengths[k + 1];
-
-                for (var i = 0; i < array.Length; i++)
-                {
-                    int k = i;
-                    for (int n = 0; n < rank; n++)
-                    {
-                        int offset = k / sizes[n];
-                        k = k - offset * sizes[n];
-                        index[n] = offset;
-                    }
-                    array.SetValue(DeserializeInner(et, stream), index);
-                }
-            }
-
-            return array;
-        }
-
-        private static int[] ReadArrayLengths(int n, BinaryTokenStreamReader stream)
-        {
-            var result = new int[n];
-            for (var i = 0; i < n; i++)
-                result[i] = stream.ReadInt();
-
-            return result;
-        }
-
+        
         internal static Deserializer GetDeserializer(Type t)
         {
             Deserializer deser;
