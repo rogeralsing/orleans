@@ -66,8 +66,9 @@
     <Reference Include="System" />
     <Reference Include="System.Management" />
     <Reference Include="System.Xml" />
-    <Reference Include="Wire">
-      <HintPath>..\..\..\Wire\Wire\bin\Release\Wire.dll</HintPath>
+    <Reference Include="Wire, Version=1.0.0.0, Culture=neutral, processorArchitecture=MSIL">
+      <SpecificVersion>False</SpecificVersion>
+      <HintPath>..\..\..\Wire\Wire\bin\Debug\Wire.dll</HintPath>
     </Reference>
   </ItemGroup>
   <ItemGroup>
@@ -140,6 +141,7 @@
     <Compile Include="Core\IGrainFactory.cs" />
     <Compile Include="Runtime\IGrainRuntime.cs" />
     <Compile Include="Serialization\Wire\ByteArraySegmentSerializerFactory.cs" />
+    <Compile Include="Serialization\Wire\OrleansAttributeSerializerFactory.cs" />
     <Compile Include="Serialization\Wire\OrleansExternalSerializerFacory.cs" />
     <Compile Include="Serialization\OrleansJsonSerializer.cs" />
     <Compile Include="Serialization\BinaryFormatterSerializer.cs" />

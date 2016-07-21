@@ -180,10 +180,13 @@ namespace Orleans.Serialization
         {
             var orleansExternalSerializer = new OrleansExternalSerializerFacory(externalSerializers);
             var byteArraySegmentSerializer = new ByteArraySegmentSerializerFactory();
+            var orleansAttributeSerializer = new OrleansAttributeSerializerFactory();
+            
             var wireOptions = new SerializerOptions(
                 preserveObjectReferences: true,
                 serializerFactories: new ValueSerializerFactory[]
                 {
+                    orleansAttributeSerializer,
                     orleansExternalSerializer,
                     byteArraySegmentSerializer
                 });
